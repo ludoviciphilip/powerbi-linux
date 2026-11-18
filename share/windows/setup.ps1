@@ -23,13 +23,25 @@ try {
     Log 'powerbi-linux setup started'
     Write-Status @{ stage = 'powerbi'; message = 'Windows is ready. Installing Power BI Desktop...' }
 
-    # 0. Time zone from the Linux host (C:\OEM\host.txt: timezone=<Windows ID>)
+    # 0. Clock + time zone from the Linux host (C:\OEM\host.txt: timezone=<Windows ID>).
+    #    The VM's hardware clock runs in UTC: tell Windows so, then sync via NTP now.
+    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' -Name RealTimeIsUniversal `
+        -PropertyType DWord -Value 1 -Force | Out-Null
     if (Test-Path 'C:\OEM\host.txt') {
         $tz = (Get-Content 'C:\OEM\host.txt' | Where-Object { $_ -like 'timezone=*' }) -replace '^timezone=', ''
         if ($tz) {
             try { Set-TimeZone -Id $tz.Trim(); Log "time zone set to $tz" } catch { Log "could not set time zone '$tz': $_" }
         }
     }
+    try {
+        Set-Service w32time -StartupType Automatic; Start-Service w32time
+        w32tm /config /manualpeerlist:time.windows.com /syncfromflags:manual /update | Out-Null
+        for ($i = 0; $i -lt 6; $i++) {
+            Start-Sleep -Seconds 5
+            if ((w32tm /resync /force) -match 'completed successfully') { break }
+        }
+        Log "clock: $(Get-Date)"
+    } catch { Log "time sync failed (fixed on next boot): $_" }
 
     # 1. Power BI Desktop (verify Authenticode signature first)
     $setup = 'C:\OEM\PBIDesktopSetup_x64.exe'

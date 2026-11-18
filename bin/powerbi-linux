@@ -246,7 +246,7 @@ create_container() {
     [ -n "$LANGUAGE" ] && args+=(-e LANGUAGE="$LANGUAGE")
     [ -n "$REGION" ]   && args+=(-e REGION="$REGION")
     [ -n "$KEYBOARD" ] && args+=(-e KEYBOARD="$KEYBOARD")
-    [ -n "${TIMEZONE:-}" ] && args+=(-e TZ="$TIMEZONE")   # QEMU RTC follows the container's local time
+    # No TZ: the container (and so QEMU's RTC) stays in UTC; Windows is told RealTimeIsUniversal.
     if [ "$ENGINE" = podman ] && [ "$(stat -c %a /dev/kvm | cut -c3)" -lt 6 ]; then
         args+=(--group-add keep-groups)   # /dev/kvm via the kvm group (needs crun)
     fi
@@ -383,15 +383,25 @@ EOF
     fi
     cp -f "$SHARE_DIR"/windows/* "$OEM_DIR/" || die "Missing $SHARE_DIR/windows — run ./install.sh from the repository."
     printf 'timezone=%s\r\n' "$wintz" >"$OEM_DIR/host.txt"
-    [ -s "$OEM_DIR/PBIDesktopSetup_x64.exe" ] || download_powerbi "$OEM_DIR/PBIDesktopSetup_x64.exe"
-    rm -f "$EXCHANGE_DIR/status.txt"
+    # An existing Windows disk (e.g. after 'uninstall' without --purge) is reused as is.
+    local existing=0; [ -e "$STORAGE_DIR/data.img" ] && existing=1
+    if [ "$existing" = 0 ]; then
+        [ -s "$OEM_DIR/PBIDesktopSetup_x64.exe" ] || download_powerbi "$OEM_DIR/PBIDesktopSetup_x64.exe"
+        rm -f "$EXCHANGE_DIR/status.txt"
+    fi
 
     info "Pulling the Windows VM image (dockurr/windows)…"
     engine pull docker.io/dockurr/windows:latest >/dev/null || die "Could not pull docker.io/dockurr/windows"
     create_container || die "Could not create the container."
     ok "VM created."
     install_desktop_integration
-    wait_for_install
+    if [ "$existing" = 1 ]; then
+        info "Reusing the existing Windows disk; waiting for Windows to boot…"
+        local i; for i in $(seq 1 60); do rdp_ready && break; sleep 5; done
+        rdp_ready || die "Windows did not come up. Check http://127.0.0.1:$WEB_PORT"
+    else
+        wait_for_install
+    fi
     # hand the running VM over to the systemd unit so logout/shutdown stops it cleanly
     have systemctl && systemctl --user start "$UNIT_NAME" 2>/dev/null
     echo
