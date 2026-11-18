@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+# powerbi-linux — run Microsoft Power BI Desktop on Linux in a Windows VM
+# (dockur/windows + KVM in Podman/Docker), opened as a normal window via FreeRDP.
+#
+# https://github.com/ludoviciphilip/powerbi-linux — MIT License
+set -uo pipefail
+
+VERSION_STR="0.1.0"
+APP=powerbi-linux
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/$APP"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+PASS_FILE="$CONFIG_DIR/password"
+SHARE_DIR="$DATA_DIR/app"            # windows scripts + icon (copied by install.sh)
+OEM_DIR="$DATA_DIR/oem"              # mounted at /oem  -> C:\OEM
+EXCHANGE_DIR="$DATA_DIR/exchange"    # mounted at /shared -> \\host.lan\Data
+LOG_FILE="$STATE_DIR/$APP.log"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/$APP-$(id -u).lock"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+UNIT_NAME="$APP-vm.service"
+WM_CLASS="$APP"
+PBI_URL="https://download.microsoft.com/download/8/8/0/880BCA75-79DD-466A-927D-1ABF1F5454B0/PBIDesktopSetup_x64.exe"
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+if [ -t 1 ]; then B=$'\e[1m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'; else B='' R='' G='' Y='' N=''; fi
+info() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '%s ✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s !%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s ✗ %s%s\n' "$R" "$*" "$N" >&2; exit 1; }
+log()  { mkdir -p "$STATE_DIR"; printf '[%(%F %T)T] %s\n' -1 "$*" >>"$LOG_FILE"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+gui_notify() { have notify-send && notify-send --app-name="Power BI" --icon="$SHARE_DIR/powerbi-linux.svg" "$@" 2>/dev/null; return 0; }
+gui_error()  {
+    log "error: $*"
+    if have zenity; then zenity --error --title="Power BI" --width=420 --text="$*" 2>/dev/null
+    else gui_notify --urgency=critical "Power BI" "$*"; fi
+}
+
+load_config() {
+    [ -f "$CONFIG_FILE" ] || die "Not installed yet. Run: $APP install"
+    # shellcheck source=/dev/null
+    . "$CONFIG_FILE"
+    : "${ENGINE:?}" "${CONTAINER:?}" "${RDP_PORT:?}" "${WEB_PORT:?}" "${WIN_USER:?}"
+    : "${STORAGE_DIR:=$DATA_DIR/storage}" "${SHARE_HOME:=yes}" "${ON_CLOSE:=ask}" "${FREERDP_EXTRA:=}"
+    read -r -a FREERDP <<<"$FREERDP_CMD"   # may be "flatpak run --command=xfreerdp com.freerdp.FreeRDP"
+}
+
+engine() { "$ENGINE" "$@"; }
+vm_state() { engine inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing; }
+
+# FreeRDP: feed every argument (incl. the password) through stdin so nothing
+# sensitive shows up in `ps`. /args-from cannot be mixed with other arguments.
+rdp_args_common() {
+    printf '%s\n' "/v:127.0.0.1:$RDP_PORT" "/u:$WIN_USER" "/d:" "/p:$(cat "$PASS_FILE")"
+}
+rdp_ready() {
+    { rdp_args_common; printf '%s\n' /cert:ignore /auth-only; } \
+        | timeout 30 "${FREERDP[@]}" /args-from:stdin >/dev/null 2>&1
+}
+
+status_field() {  # read a key from the status file Windows writes to the exchange folder
+    local f="$EXCHANGE_DIR/status.txt"
+    [ -f "$f" ] || return 1
+    tr -d '\r' <"$f" | sed -n "s/^$1=//p" | tail -1
+}
+
+# ----------------------------------------------------------------------------
+# detection
+# ----------------------------------------------------------------------------
+detect_freerdp() {
+    local c v
+    for c in xfreerdp3 xfreerdp; do
+        if have "$c"; then
+            v=$("$c" --version 2>/dev/null | grep -oE 'version [0-9]+' | grep -oE '[0-9]+')
+            [ "${v:-0}" -ge 3 ] && { echo "$c"; return 0; }
+        fi
+    done
+    if have flatpak && flatpak info com.freerdp.FreeRDP >/dev/null 2>&1; then
+        echo "flatpak run --command=xfreerdp com.freerdp.FreeRDP"; return 0
+    fi
+    return 1
+}
+
+detect_engine() {
+    if have podman; then echo podman; elif have docker; then echo docker; else return 1; fi
+}
+
+# en_US.UTF-8 -> en-US
+locale_to_culture() { local l="${1%%.*}"; l="${l%%@*}"; [[ "$l" =~ ^[a-z]{2}_[A-Z]{2}$ ]] && echo "${l/_/-}"; }
+
+detect_keyboard_culture() {
+    # Ask the desktop first (on Wayland, setxkbmap only sees XWayland's default "us").
+    local lay=""
+    unset_lay() { [ -z "$lay" ] || [ "$lay" = "(unset)" ]; }
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && have hyprctl; then
+        lay=$(hyprctl getoption input:kb_layout 2>/dev/null | sed -n 's/^str: *//p' | cut -d, -f1)
+    fi
+    if unset_lay && have gsettings; then
+        lay=$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null | grep -oE "'xkb', '[^']+'" | head -1 | sed -E "s/.*, '([^'+]+).*/\1/")
+    fi
+    if unset_lay; then
+        local k; for k in kreadconfig6 kreadconfig5; do
+            have "$k" && lay=$("$k" --file kxkbrc --group Layout --key LayoutList 2>/dev/null | cut -d, -f1) && [ -n "$lay" ] && break
+        done
+    fi
+    unset_lay && have localectl && lay=$(localectl status 2>/dev/null | sed -n 's/.*X11 Layout: *//p' | cut -d, -f1)
+    if unset_lay && have localectl; then
+        lay=$(localectl status 2>/dev/null | sed -n 's/.*VC Keymap: *//p'); lay="${lay%%-*}"
+    fi
+    if unset_lay && [ -z "${WAYLAND_DISPLAY:-}" ] && have setxkbmap; then
+        lay=$(setxkbmap -query 2>/dev/null | sed -n 's/^layout: *//p' | cut -d, -f1)
+    fi
+    case "$lay" in
+        us) echo en-US ;; gb|uk) echo en-GB ;; br) echo pt-BR ;; pt) echo pt-PT ;;
+        de) echo de-DE ;; fr) echo fr-FR ;; es) echo es-ES ;; latam) echo es-MX ;;
+        it) echo it-IT ;; nl) echo nl-NL ;; be) echo nl-BE ;; ch) echo de-CH ;;
+        se) echo sv-SE ;; no) echo nb-NO ;; dk) echo da-DK ;; fi) echo fi-FI ;;
+        pl) echo pl-PL ;; cz) echo cs-CZ ;; hu) echo hu-HU ;; ru) echo ru-RU ;;
+        tr) echo tr-TR ;; jp) echo ja-JP ;; kr) echo ko-KR ;; *) echo "" ;;
+    esac
+}
+
+detect_timezone() {  # IANA name, e.g. America/Sao_Paulo
+    local tz=""
+    have timedatectl && tz=$(timedatectl show -p Timezone --value 2>/dev/null)
+    [ -z "$tz" ] && [ -L /etc/localtime ] && tz=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
+    [ -z "$tz" ] && [ -r /etc/timezone ] && tz=$(cat /etc/timezone)
+    echo "${tz:-${TZ:-UTC}}"
+}
+
+windows_timezone() {  # IANA -> Windows time zone ID (Unicode CLDR mapping)
+    local map="$SHARE_DIR/tzmap.tsv" w=""
+    [ -r "$map" ] && w=$(awk -F'\t' -v tz="$1" '$1 == tz { print $2; exit }' "$map")
+    case "$1" in UTC|Etc/UTC|Etc/GMT|GMT|Universal|Zulu) w="UTC" ;; esac
+    echo "$w"
+}
+
+total_ram_gb() { awk '/MemTotal/ {printf "%d", $2/1024/1024 + 0.5}' /proc/meminfo; }
+
+# ----------------------------------------------------------------------------
+# install
+# ----------------------------------------------------------------------------
+usage_install() {
+    cat <<EOF
+Usage: $APP install [options]
+
+  --ram SIZE        RAM for Windows, e.g. 6G      (default: 1/3 of host RAM, 4G-8G)
+  --cpus N          CPU cores for Windows         (default: half of host threads, max 6)
+  --disk SIZE       Virtual disk size             (default: 64G, grows on demand)
+  --language CODE   Windows display language, e.g. en-US, pt-BR, de-DE  (default: from \$LANG)
+  --region CODE     Number/date/currency format, e.g. pt-BR  (default: from \$LC_NUMERIC)
+  --keyboard CODE   Windows keyboard layout, e.g. pt-BR      (default: from your layout)
+  --timezone ZONE   IANA time zone, e.g. Europe/Berlin       (default: host time zone)
+  --engine NAME     podman (recommended) or docker
+  --no-share-home   Don't expose your home folder inside Windows
+  --yes             Don't ask for confirmation
+EOF
+}
+
+preflight() {
+    local fail=0
+    [ "$(uname -m)" = x86_64 ] || { warn "Only x86_64 hosts are supported."; fail=1; }
+    if [ ! -e /dev/kvm ]; then
+        warn "/dev/kvm not found: enable virtualization (Intel VT-x / AMD-V) in BIOS/UEFI and load kvm_intel or kvm_amd."; fail=1
+    elif [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+        warn "No permission on /dev/kvm. Fix: sudo usermod -aG kvm $USER  (then log out and back in)"; fail=1
+    fi
+    [ -e /dev/net/tun ] || warn "/dev/net/tun missing; the VM will fall back to slower user-mode networking."
+    ENGINE_DET=$(detect_engine) || { warn "Podman (recommended) or Docker is required."; fail=1; }
+    FREERDP_DET=$(detect_freerdp) || { warn "FreeRDP 3 (xfreerdp3 / xfreerdp >= 3) is required."; fail=1; }
+    have curl || { warn "curl is required."; fail=1; }
+    have zenity || warn "zenity not found: no 'shut down Windows?' dialog when you close Power BI (optional)."
+    have notify-send || warn "notify-send not found: no desktop notifications (optional)."
+    if [ "$fail" = 1 ]; then
+        echo; info "Install the missing pieces (see ./install.sh --deps for your distro) and run again."
+        exit 1
+    fi
+}
+
+write_config() {
+    local ram="$1" cpus="$2" disk="$3" lang="$4" region="$5" kbd="$6" engine="$7" share="$8" tz="$9"
+    local user="${USER,,}"
+    [[ "$user" =~ ^[a-z][a-z0-9_-]{0,19}$ ]] && [[ ! "$user" =~ ^(administrator|admin|guest|user|defaultaccount)$ ]] || user="pbiuser"
+    mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
+    cat >"$CONFIG_FILE" <<EOF
+# $APP configuration. Most changes need: $APP stop && $APP open
+# VM settings (RAM/CPU/disk/language) only apply on a fresh install: $APP reinstall
+ENGINE="$engine"
+FREERDP_CMD="$FREERDP_DET"
+CONTAINER="$APP"
+WIN_USER="$user"
+RAM_SIZE="$ram"
+CPU_CORES="$cpus"
+DISK_SIZE="$disk"
+WIN_VERSION="11"
+LANGUAGE="$lang"
+REGION="$region"
+KEYBOARD="$kbd"
+# Host time zone (IANA); Windows gets the matching zone at install time
+TIMEZONE="$tz"
+# Ports on 127.0.0.1 only (never exposed to the network)
+RDP_PORT="47389"
+WEB_PORT="48006"
+STORAGE_DIR="$DATA_DIR/storage"
+# Expose your Linux home inside Windows as drive "Linux" (This PC)
+SHARE_HOME="$share"
+# When the Power BI window closes: ask | stop | keep
+ON_CLOSE="ask"
+# Extra FreeRDP arguments, one per line inside the quotes, e.g. "/scale:140"
+FREERDP_EXTRA=""
+EOF
+    if [ ! -s "$PASS_FILE" ]; then
+        ( umask 077; tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24 >"$PASS_FILE" )
+    fi
+    chmod 600 "$PASS_FILE" "$CONFIG_FILE"
+}
+
+download_powerbi() {  # $1 = destination file
+    local dst="$1" tmp="$1.part"
+    info "Downloading Power BI Desktop (~700 MB) from Microsoft…"
+    curl -fL --retry 3 -C - --progress-bar -o "$tmp" "$PBI_URL" || { rm -f "$tmp"; die "Download failed: $PBI_URL"; }
+    local size; size=$(stat -c %s "$tmp")
+    [ "$size" -gt 100000000 ] || { rm -f "$tmp"; die "Downloaded file is too small ($size bytes)."; }
+    mv -f "$tmp" "$dst"
+    curl -fsIL "$PBI_URL" | tr -d '\r' | sed -n 's/^[Ee][Tt]ag: *//p' | tail -1 >"$dst.etag" || true
+    ok "Power BI installer downloaded (signature is verified inside Windows before running)."
+}
+
+create_container() {
+    local -a args=(
+        run -d --name "$CONTAINER"
+        --device /dev/kvm --device /dev/net/tun
+        --cap-add NET_ADMIN --cap-add NET_RAW
+        -p "127.0.0.1:$RDP_PORT:3389/tcp" -p "127.0.0.1:$RDP_PORT:3389/udp"
+        -p "127.0.0.1:$WEB_PORT:8006"
+        -v "$STORAGE_DIR:/storage:Z" -v "$OEM_DIR:/oem:Z" -v "$EXCHANGE_DIR:/shared:Z"
+        -e VERSION="$WIN_VERSION" -e RAM_SIZE -e CPU_CORES -e DISK_SIZE
+        -e USERNAME="$WIN_USER" -e PASSWORD
+        --stop-timeout 120
+    )
+    [ -n "$LANGUAGE" ] && args+=(-e LANGUAGE="$LANGUAGE")
+    [ -n "$REGION" ]   && args+=(-e REGION="$REGION")
+    [ -n "$KEYBOARD" ] && args+=(-e KEYBOARD="$KEYBOARD")
+    [ -n "${TIMEZONE:-}" ] && args+=(-e TZ="$TIMEZONE")   # QEMU RTC follows the container's local time
+    if [ "$ENGINE" = podman ] && [ "$(stat -c %a /dev/kvm | cut -c3)" -lt 6 ]; then
+        args+=(--group-add keep-groups)   # /dev/kvm via the kvm group (needs crun)
+    fi
+    RAM_SIZE="$RAM_SIZE" CPU_CORES="$CPU_CORES" DISK_SIZE="$DISK_SIZE" PASSWORD="$(cat "$PASS_FILE")" \
+        engine "${args[@]}" docker.io/dockurr/windows:latest >/dev/null
+}
+
+wait_for_install() {
+    local start=$SECONDS last="" msg st
+    info "Installing Windows + Power BI. This takes 20–60 min (mostly the ~7 GB Windows download)."
+    info "Watch it live at http://127.0.0.1:$WEB_PORT (optional)."
+    while :; do
+        st=$(vm_state)
+        [ "$st" = running ] || { engine logs --tail 30 "$CONTAINER" 2>&1 | tr '\r' '\n' | tail -15 >&2; die "The VM stopped unexpectedly (state: $st). See above."; }
+        if [ "$(status_field stage 2>/dev/null)" = "done" ]; then
+            echo; ok "Power BI Desktop $(status_field powerbi_version) installed ($(( (SECONDS-start)/60 )) min)."
+            return 0
+        fi
+        if [ "$(status_field stage 2>/dev/null)" = error ]; then
+            echo; die "Setup inside Windows failed: $(status_field error). Log: $EXCHANGE_DIR/setup.log"
+        fi
+        msg=$(engine exec "$CONTAINER" cat /run/shm/msg.html 2>/dev/null | sed 's/<[^>]*>//g' | tr -s ' ')
+        [ -z "$msg" ] && msg=$(status_field message 2>/dev/null)
+        [ -z "$msg" ] && msg="Installing Windows…"
+        if [ "$msg" != "$last" ]; then printf '\r\e[K   %s' "$msg"; last="$msg"; fi
+        [ $(( SECONDS - start )) -gt 10800 ] && { echo; die "Timed out after 3 h. Check http://127.0.0.1:$WEB_PORT"; }
+        sleep 10
+    done
+}
+
+install_desktop_integration() {
+    local bin; bin=$(command -v "$APP" || echo "$HOME/.local/bin/$APP")
+    mkdir -p "$APPS_DIR"
+    cat >"$APPS_DIR/$APP.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Power BI Desktop
+GenericName=Power BI (Windows VM)
+Comment=Microsoft Power BI Desktop running in a local Windows VM
+Exec=$bin open
+Icon=$SHARE_DIR/powerbi-linux.svg
+StartupWMClass=$WM_CLASS
+Categories=Office;
+Keywords=powerbi;pbi;dax;windows;
+Terminal=false
+Actions=stop;
+
+[Desktop Action stop]
+Name=Shut down the Windows VM
+Exec=$bin stop
+EOF
+    have update-desktop-database && update-desktop-database "$APPS_DIR" 2>/dev/null
+    if have systemctl && systemctl --user show-environment >/dev/null 2>&1; then
+        mkdir -p "$UNIT_DIR"
+        cat >"$UNIT_DIR/$UNIT_NAME" <<EOF
+[Unit]
+Description=Windows VM for Power BI Desktop ($APP)
+# Started on demand by '$APP open'. On logout/shutdown systemd stops it,
+# which shuts Windows down cleanly instead of killing it.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$(command -v "$ENGINE") start $CONTAINER
+ExecStop=$(command -v "$ENGINE") stop --time 110 $CONTAINER
+TimeoutStartSec=90
+TimeoutStopSec=130
+EOF
+        systemctl --user daemon-reload
+    fi
+    ok "Added 'Power BI Desktop' to your applications menu."
+}
+
+cmd_install() {
+    local ram="" cpus="" disk="64G" lang="" region="" kbd="" engine="" share=yes yes=0 tz=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ram) ram="$2"; shift ;; --cpus) cpus="$2"; shift ;; --disk) disk="$2"; shift ;;
+            --language) lang="$2"; shift ;; --region) region="$2"; shift ;; --keyboard) kbd="$2"; shift ;;
+            --engine) engine="$2"; shift ;; --timezone) tz="$2"; shift ;; --no-share-home) share=no ;; --yes|-y) yes=1 ;;
+            -h|--help) usage_install; exit 0 ;; *) usage_install; die "Unknown option: $1" ;;
+        esac; shift
+    done
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config
+        if [ "$(vm_state)" != missing ]; then
+            ok "Already installed (container '$CONTAINER' exists)."
+            install_desktop_integration
+            info "Open it with: $APP open    (or 'Power BI Desktop' in your app menu)"
+            return 0
+        fi
+    fi
+
+    preflight
+    [ -n "$engine" ] && ENGINE_DET="$engine"
+    local ramgb; ramgb=$(total_ram_gb)
+    if [ -z "$ram" ]; then local r=$(( ramgb / 3 )); [ $r -lt 4 ] && r=4; [ $r -gt 8 ] && r=8; ram="${r}G"; fi
+    [ "$ramgb" -lt 8 ] && warn "Only ${ramgb} GB RAM on this machine: Windows + Power BI will be slow."
+    if [ -z "$cpus" ]; then cpus=$(( $(nproc) / 2 )); [ "$cpus" -lt 2 ] && cpus=2; [ "$cpus" -gt 6 ] && cpus=6; fi
+    [ -z "$lang" ]   && lang=$(locale_to_culture "${LANG:-}")
+    [ -z "$region" ] && region=$(locale_to_culture "${LC_NUMERIC:-$(locale 2>/dev/null | sed -n 's/^LC_NUMERIC="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')}")
+    [ -z "$region" ] && region="$lang"
+    [ -z "$kbd" ]    && kbd=$(detect_keyboard_culture)
+    [ -z "$kbd" ]    && kbd="$region"
+    [ -z "$tz" ]     && tz=$(detect_timezone)
+    local wintz; wintz=$(windows_timezone "$tz")
+    [ -z "$wintz" ] && warn "No Windows time zone known for '$tz'; Windows will keep its default zone."
+
+    local free_gb; mkdir -p "$DATA_DIR"; free_gb=$(df -BG --output=avail "$DATA_DIR" | tail -1 | tr -dc 0-9)
+    cat <<EOF
+
+${B}Power BI Desktop on Linux — install plan${N}
+  Engine ............ $ENGINE_DET
+  FreeRDP ........... $FREERDP_DET
+  Windows ........... 11, language ${lang:-en-US}, formats ${region:-default}, keyboard ${kbd:-default}
+  Time zone ......... $tz${wintz:+ ($wintz)}
+  Resources ......... $ram RAM, $cpus cores, $disk disk (sparse; ~30 GB used after install)
+  Storage ........... $DATA_DIR  (${free_gb} GB free)
+  Share home ........ $share
+  Downloads ......... Windows 11 ISO (~7 GB, from Microsoft) + Power BI (~700 MB, from Microsoft)
+
+  You need a valid Windows license to use Windows beyond evaluation. Power BI Desktop is free.
+EOF
+    [ "${free_gb:-0}" -lt 45 ] && warn "Less than 45 GB free in $DATA_DIR; the install may run out of space."
+    if [ "$yes" != 1 ]; then read -rp "Continue? [Y/n] " a; [[ "${a:-y}" =~ ^[Yy] ]] || exit 0; fi
+
+    write_config "$ram" "$cpus" "$disk" "$lang" "$region" "$kbd" "$ENGINE_DET" "$share" "$tz"
+    load_config
+
+    mkdir -p "$STORAGE_DIR" "$OEM_DIR" "$EXCHANGE_DIR" "$STATE_DIR"
+    # btrfs: disable copy-on-write for the VM disk image (avoids heavy fragmentation)
+    if [ "$(stat -f -c %T "$STORAGE_DIR")" = btrfs ] && [ -z "$(ls -A "$STORAGE_DIR")" ]; then
+        chattr +C "$STORAGE_DIR" 2>/dev/null && ok "btrfs: disabled copy-on-write for the VM disk."
+    fi
+    cp -f "$SHARE_DIR"/windows/* "$OEM_DIR/" || die "Missing $SHARE_DIR/windows — run ./install.sh from the repository."
+    printf 'timezone=%s\r\n' "$wintz" >"$OEM_DIR/host.txt"
+    [ -s "$OEM_DIR/PBIDesktopSetup_x64.exe" ] || download_powerbi "$OEM_DIR/PBIDesktopSetup_x64.exe"
+    rm -f "$EXCHANGE_DIR/status.txt"
+
+    info "Pulling the Windows VM image (dockurr/windows)…"
+    engine pull docker.io/dockurr/windows:latest >/dev/null || die "Could not pull docker.io/dockurr/windows"
+    create_container || die "Could not create the container."
+    ok "VM created."
+    install_desktop_integration
+    wait_for_install
+    # hand the running VM over to the systemd unit so logout/shutdown stops it cleanly
+    have systemctl && systemctl --user start "$UNIT_NAME" 2>/dev/null
+    echo
+    ok "All set! Open 'Power BI Desktop' from your app menu, or run: $APP open"
+    info "Tip: closing the window only disconnects; you'll be asked whether to shut Windows down."
+}
+
+# ----------------------------------------------------------------------------
+# runtime
+# ----------------------------------------------------------------------------
+vm_start() {
+    if have systemctl && [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
+        systemctl --user start "$UNIT_NAME"
+    else
+        [ "$(vm_state)" = running ] || engine start "$CONTAINER" >/dev/null
+    fi
+}
+
+vm_stop() {
+    if have systemctl && [ -f "$UNIT_DIR/$UNIT_NAME" ]; then systemctl --user stop "$UNIT_NAME"; fi
+    [ "$(vm_state)" = running ] && engine stop --time 110 "$CONTAINER" >/dev/null
+    return 0
+}
+
+focus_existing() {
+    if have hyprctl; then hyprctl dispatch "hl.dsp.focus({ window = \"class:$WM_CLASS\" })" >/dev/null 2>&1 \
+        || hyprctl dispatch focuswindow "class:$WM_CLASS" >/dev/null 2>&1
+    elif have wmctrl; then wmctrl -x -a "$WM_CLASS" 2>/dev/null; fi
+    return 0
+}
+
+cmd_open() {
+    load_config
+    cd "$HOME" || true
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { log "already open, focusing"; focus_existing; exit 0; }
+
+    local st; st=$(vm_state)
+    [ "$st" = missing ] && { gui_error "The Windows VM does not exist. Run: $APP install"; exit 1; }
+    if [ "$st" != running ]; then
+        gui_notify --urgency=low "Power BI" "Starting Windows… (about a minute)"
+        log "starting VM"
+    fi
+    vm_start || { gui_error "Could not start the Windows VM. Log: $LOG_FILE"; exit 1; }
+
+    local i
+    for i in $(seq 1 60); do
+        rdp_ready && break
+        [ "$i" = 60 ] && { gui_error "Windows did not answer in time. Check http://127.0.0.1:$WEB_PORT"; exit 1; }
+        sleep 5
+    done
+    log "RDP ready"
+
+    local -a extra=()
+    [ "$SHARE_HOME" = yes ] && extra+=("/drive:Linux,$HOME")
+    [ -n "$FREERDP_EXTRA" ] && mapfile -t -O "${#extra[@]}" extra <<<"$FREERDP_EXTRA"
+    {
+        rdp_args_common
+        printf '%s\n' /cert:tofu +dynamic-resolution +auto-reconnect /size:85% \
+            "/wm-class:$WM_CLASS" "/t:Power BI Desktop" "${extra[@]}"
+    } | "${FREERDP[@]}" /args-from:stdin >>"$STATE_DIR/freerdp.log" 2>&1
+    log "session closed (rc=$?)"
+
+    case "$ON_CLOSE" in
+        stop) vm_stop_gui ;;
+        keep) : ;;
+        *)
+            if have zenity && zenity --question --title="Power BI" --width=400 \
+                --text="The Power BI window was closed.\n\nShut Windows down now? Save your .pbix first: unsaved changes will be lost." \
+                --ok-label="Shut down" --cancel-label="Keep running" 2>/dev/null; then
+                vm_stop_gui
+            else
+                gui_notify --urgency=low "Power BI" "Windows is still running. Shut it down later with: $APP stop"
+            fi ;;
+    esac
+}
+
+vm_stop_gui() {
+    gui_notify --urgency=low "Power BI" "Shutting Windows down…"
+    log "stopping VM"; vm_stop; log "VM stopped"
+    gui_notify --urgency=low "Power BI" "Windows has been shut down."
+}
+
+cmd_stop() {
+    load_config
+    if [ "$(vm_state)" != running ]; then ok "The VM is not running."; return 0; fi
+    info "Shutting Windows down…"; vm_stop; ok "Stopped."
+}
+
+cmd_status() {
+    load_config
+    local st; st=$(vm_state)
+    echo "VM container ...... $CONTAINER ($ENGINE): $st"
+    if [ "$st" = running ]; then
+        if rdp_ready; then echo "Windows ........... ready (RDP on 127.0.0.1:$RDP_PORT)"; else echo "Windows ........... booting / not reachable"; fi
+        echo "VM screen ......... http://127.0.0.1:$WEB_PORT"
+    fi
+    echo "Power BI .......... $(status_field powerbi_version 2>/dev/null || echo unknown)"
+    echo "Setup stage ....... $(status_field stage 2>/dev/null || echo unknown)"
+    echo "Disk usage ........ $(du -sh "$STORAGE_DIR" 2>/dev/null | cut -f1)"
+    echo "Config ............ $CONFIG_FILE"
+}
+
+cmd_update() {
+    load_config
+    mkdir -p "$EXCHANGE_DIR/update"; chmod 2777 "$EXCHANGE_DIR/update"  # Windows (samba) must be able to delete it
+    local etag_now etag_old
+    etag_now=$(curl -fsIL "$PBI_URL" | tr -d '\r' | sed -n 's/^[Ee][Tt]ag: *//p' | tail -1)
+    etag_old=$(cat "$OEM_DIR/PBIDesktopSetup_x64.exe.etag" 2>/dev/null)
+    if [ -n "$etag_now" ] && [ "$etag_now" = "$etag_old" ] && [ "${1:-}" != --force ]; then
+        ok "Power BI is already the latest version ($(status_field powerbi_version)). Use --force to reinstall."
+        return 0
+    fi
+    download_powerbi "$EXCHANGE_DIR/update/PBIDesktopSetup_x64.exe"
+    cp -f "$EXCHANGE_DIR/update/PBIDesktopSetup_x64.exe.etag" "$OEM_DIR/PBIDesktopSetup_x64.exe.etag" 2>/dev/null
+    info "The update installs automatically the next time Windows starts."
+    if [ "$(vm_state)" = running ]; then
+        read -rp "Restart Windows now to apply it? Save your work in Power BI first. [y/N] " a
+        if [[ "$a" =~ ^[Yy] ]]; then vm_stop; vm_start; ok "Restarted; open Power BI in a minute or two."; fi
+    fi
+}
+
+cmd_uninstall() {
+    local purge=0 yes=0
+    for a in "$@"; do case "$a" in --purge) purge=1 ;; --yes|-y) yes=1 ;; esac; done
+    [ -f "$CONFIG_FILE" ] && load_config || { ENGINE=$(detect_engine || echo podman); CONTAINER=$APP; STORAGE_DIR="$DATA_DIR/storage"; }
+    if [ "$yes" != 1 ]; then
+        if [ "$purge" = 1 ]; then read -rp "Remove the VM, its Windows disk (all files inside Windows!) and the config? [y/N] " a
+        else read -rp "Remove the VM container and menu entry (keeps the Windows disk, reinstall later)? [y/N] " a; fi
+        [[ "$a" =~ ^[Yy] ]] || exit 0
+    fi
+    have systemctl && systemctl --user stop "$UNIT_NAME" 2>/dev/null
+    [ "$(vm_state)" = running ] && engine stop --time 110 "$CONTAINER" >/dev/null
+    engine rm -f "$CONTAINER" >/dev/null 2>&1
+    rm -f "$UNIT_DIR/$UNIT_NAME" "$APPS_DIR/$APP.desktop"
+    have systemctl && systemctl --user daemon-reload 2>/dev/null
+    if [ "$purge" = 1 ]; then
+        # files written by the container belong to sub-UIDs: delete them inside the user namespace
+        if [ "$ENGINE" = podman ]; then podman unshare rm -rf "$DATA_DIR/storage" "$EXCHANGE_DIR" "$OEM_DIR"; fi
+        rm -rf "$DATA_DIR/storage" "$OEM_DIR" "$EXCHANGE_DIR" "$CONFIG_DIR" "$STATE_DIR" 2>/dev/null \
+            || warn "Some files are owned by root (Docker). Remove with: sudo rm -rf $DATA_DIR"
+        rm -f "$HOME/.config/freerdp/server/127.0.0.1_${RDP_PORT:-47389}.pem" 2>/dev/null
+        ok "Removed everything (the dockurr/windows image stays; remove with: $ENGINE rmi dockurr/windows)."
+    else
+        ok "Removed the container. Windows disk kept in $STORAGE_DIR — '$APP install' recreates it."
+    fi
+}
+
+cmd_reinstall() {
+    load_config
+    warn "This deletes the Windows VM disk and installs Windows + Power BI again."
+    cmd_uninstall --purge "$@" && cmd_install "$@"
+}
+
+usage() {
+    cat <<EOF
+$APP $VERSION_STR — Power BI Desktop on Linux (Windows VM via KVM + FreeRDP)
+
+Usage: $APP <command>
+
+  install [opts]   Create the Windows VM and install Power BI (run '$APP install --help')
+  open             Start the VM if needed and open Power BI in a window (default)
+  stop             Shut Windows down cleanly
+  status           Show VM / Power BI status
+  update [--force] Download the latest Power BI; installs on next Windows start
+  uninstall        Remove the VM container + menu entry (--purge also deletes the disk/config)
+  reinstall        Wipe and install from scratch
+  version          Print version
+EOF
+}
+
+case "${1:-open}" in
+    install)   shift; cmd_install "$@" ;;
+    open|start) cmd_open ;;
+    stop)      cmd_stop ;;
+    status)    cmd_status ;;
+    update)    shift; cmd_update "$@" ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
+    reinstall) shift; cmd_reinstall "$@" ;;
+    version|--version) echo "$APP $VERSION_STR" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+esac
